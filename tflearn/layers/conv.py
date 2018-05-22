@@ -518,7 +518,7 @@ def atrous_conv_3d(incoming, nb_filter, filter_size, rate=1, padding='same',
             # Track per layer variables
             tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, b)
 
-        inference = tf.nn.convolution(incoming, W, padding, dilation_rate=rate )
+        inference = tf.nn.convolution(incoming, W, padding, dilation_rate=[rate]*3  )
         #inference = tf.nn.atrous_conv2d(incoming, W, rate, padding)
         if b is not None: inference = tf.nn.bias_add(inference, b)
 
@@ -536,6 +536,190 @@ def atrous_conv_3d(incoming, nb_filter, filter_size, rate=1, padding='same',
     # Add attributes to Tensor to easy access weights.
     inference.scope = scope
     inference.W = W
+    inference.b = b
+
+    # Track output tensor.
+    tf.add_to_collection(tf.GraphKeys.LAYER_TENSOR + '/' + name, inference)
+
+    return inference
+
+def transpose_dilation_3d(incoming, nb_filter, filter_size, transpose_filter_size, kernel_strides=2, padding='same',
+                   activation='linear', bias=True, weights_init='uniform_scaling',
+                   bias_init='zeros', regularizer=None, weight_decay=0.001,
+                   trainable=True, restore=True, reuse=False, scope=None,
+                   name="AtrousConv3D"):
+    """ Atrous Convolution 3D.
+
+    (a.k.a. convolution with holes or dilated convolution).
+
+    Computes a 3-D atrous convolution, also known as convolution with holes or
+    dilated convolution, given 5-D value and filters tensors. If the rate
+    parameter is equal to one, it performs regular 3-D convolution. If the rate
+    parameter is greater than one, it performs convolution with holes, sampling
+    the input values every rate pixels in the height and width dimensions. This
+    is equivalent to convolving the input with a set of upsampled filters,
+    produced by inserting rate - 1 zeros between two consecutive values of the
+    filters along the height and width dimensions, hence the name atrous
+    convolution or convolution with holes (the French word trous means holes
+    in English).
+
+    More specifically
+    ```
+    output[b, i, j, k] = sum_{di, dj, q} filters[di, dj, q, k] *
+        value[b, i + rate * di, j + rate * dj, q]
+    ```
+
+    Atrous convolution allows us to explicitly control how densely to compute
+    feature responses in fully convolutional networks. Used in conjunction
+    with bilinear interpolation, it offers an alternative to conv2d_transpose
+    in dense prediction tasks such as semantic image segmentation,
+    optical flow computation, or depth estimation. It also allows us to
+    effectively enlarge the field of view of filters without increasing the
+    number of parameters or the amount of computation.
+
+    Input:
+        5-D Tensor [batch, height, width, depth, in_channels].
+
+    Output:
+        4-D Tensor [batch, new height, new width, new depth, nb_filter].
+
+    Arguments:
+        incoming: `Tensor`. Incoming 5-D Tensor.
+        nb_filter: `int`. The number of convolutional filters.
+        filter_size: `int` or `list of int`. Size of filters.
+        rate: `int`.  A positive int32. The stride with which we sample input
+            values across the height and width dimensions. Equivalently, the
+            rate by which we upsample the filter values by inserting zeros
+            across the height and width dimensions. In the literature, the
+            same parameter is sometimes called input `stride` or `dilation`.
+        padding: `str` from `"same", "valid"`. Padding algo to use.
+            Default: 'same'.
+        activation: `str` (name) or `function` (returning a `Tensor`) or None.
+            Activation applied to this layer (see tflearn.activations).
+            Default: 'linear'.
+        bias: `bool`. If True, a bias is used.
+        weights_init: `str` (name) or `Tensor`. Weights initialization.
+            (see tflearn.initializations) Default: 'truncated_normal'.
+        bias_init: `str` (name) or `Tensor`. Bias initialization.
+            (see tflearn.initializations) Default: 'zeros'.
+        regularizer: `str` (name) or `Tensor`. Add a regularizer to this
+            layer weights (see tflearn.regularizers). Default: None.
+        weight_decay: `float`. Regularizer decay parameter. Default: 0.001.
+        trainable: `bool`. If True, weights will be trainable.
+        restore: `bool`. If True, this layer weights will be restored when
+            loading a model.
+        reuse: `bool`. If True and 'scope' is provided, this layer variables
+            will be reused (shared).
+        scope: `str`. Define this layer scope (optional). A scope can be
+            used to share variables between layers. Note that scope will
+            override name.
+        name: A name for this layer (optional). Default: 'Conv3D'.
+
+    Attributes:
+        scope: `Scope`. This layer scope.
+        W: `Variable`. Variable representing filter weights.
+        b: `Variable`. Variable representing biases.
+
+    """
+    input_shape = utils.get_incoming_shape(incoming)
+    assert len(input_shape) == 5, "Incoming Tensor shape must be 5-D"
+    filter_size = utils.autoformat_filter_conv3d(filter_size,
+                                                 input_shape[-1],
+                                                 nb_filter)
+    padding = utils.autoformat_padding(padding)
+
+    with tf.variable_scope(scope, default_name=name, values=[incoming],
+                           reuse=reuse) as scope:
+        name = scope.name
+
+        W_init = weights_init
+        if isinstance(weights_init, str):
+            W_init = initializations.get(weights_init)()
+        elif type(W_init) in [tf.Tensor, np.ndarray, list]:
+            filter_size = None
+        W_regul = None
+        if regularizer is not None:
+            W_regul = lambda x: losses.get(regularizer)(x, weight_decay)
+        W = vs.variable('W', shape=filter_size, regularizer=W_regul,
+                        initializer=W_init, trainable=trainable,
+                        restore=restore)
+
+        # Track per layer variables
+        tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, W)
+
+        b = None
+        if bias:
+            b_shape = [nb_filter]
+            if isinstance(bias_init, str):
+                bias_init = initializations.get(bias_init)()
+            elif type(bias_init) in [tf.Tensor, np.ndarray, list]:
+                b_shape = None
+            b = vs.variable('b', shape=b_shape, initializer=bias_init,
+                            trainable=trainable, restore=restore)
+            # Track per layer variables
+            tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, b)
+
+        def get_deconv_filter(f_shape):
+            """
+            Create filter weights initialized as bilinear upsampling.
+            """
+            width = f_shape
+            heigh = f_shape
+            depth = f_shape
+            f = ceil(width/2.0)
+            c = (2 * f - 1 - f % 2) / (2.0 * f)
+            bilinear = np.zeros([f_shape, f_shape, f_shape])
+            for x in range(width):
+                for y in range(heigh):
+                    for z in range(depth):
+                        value = (1 - abs(x / f - c)) * (1 - abs(y / f - c)) * (1 - abs(z / f - c))
+                        bilinear[x, y, z] = value
+            weights = np.zeros([f_shape,f_shape,f_shape,nb_filter,nb_filter])
+            for i in range(nb_filter):
+                weights[:, :, :, i, i] = bilinear
+
+            init = tf.constant_initializer(value=weights,
+                                           dtype=tf.float32)
+            W = vs.variable(name="up_filter", initializer=init,
+                            shape=weights.shape, trainable=trainable,
+                            restore=restore)
+            tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, W)
+            return W
+
+        shape = (np.array([transpose_filter_size]*3)-1)*(kernel_strides-1) + np.array([transpose_filter_size]*3)
+        #shape = shape + 2*filter_size[0]//2 
+        shape = [input_shape[-1]] + list(shape) + [nb_filter]
+
+        weights = get_deconv_filter(transpose_filter_size)
+        #print(shape,kernel_strides)
+        W = tf.transpose(W, perm=[3, 0, 1, 2, 4])
+        W_trans = tf.nn.conv3d_transpose(W, 
+                                         weights, 
+                                         shape,
+                                         [1] + [kernel_strides]*3 + [1], 
+                                         padding='SAME'
+                                        )
+        W_trans = tf.transpose(W_trans, perm=[1, 2, 3, 0, 4])
+        print(W_trans, W, shape)
+
+        inference = tf.nn.convolution(incoming, W_trans, padding)
+        #inference = tf.nn.atrous_conv2d(incoming, W, rate, padding)
+        if b is not None: inference = tf.nn.bias_add(inference, b)
+
+        if activation:
+            if isinstance(activation, str):
+                inference = activations.get(activation)(inference)
+            elif hasattr(activation, '__call__'):
+                inference = activation(inference)
+            else:
+                raise ValueError("Invalid Activation.")
+
+        # Track activations.
+        tf.add_to_collection(tf.GraphKeys.ACTIVATIONS, inference)
+
+    # Add attributes to Tensor to easy access weights.
+    inference.scope = scope
+    inference.W = W_trans
     inference.b = b
 
     # Track output tensor.
