@@ -681,7 +681,7 @@ def transpose_dilation_3d(incoming, nb_filter, filter_size, transpose_filter_siz
             init = tf.constant_initializer(value=weights,
                                            dtype=tf.float32)
             W = vs.variable(name="up_filter", initializer=init,
-                            shape=weights.shape, trainable=trainable,
+                            shape=weights.shape, trainable=False,
                             restore=restore)
             tf.add_to_collection(tf.GraphKeys.LAYER_VARIABLES + '/' + name, W)
             return W
